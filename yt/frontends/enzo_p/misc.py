@@ -124,3 +124,25 @@ def nested_dict_get(pdict, keys, default=None):
     if val is None:
         val = default
     return val
+
+def field_subgroup_generator(parameters):
+    """
+    Create an iterator for the field subgroups in the parameter file.
+
+    Within the parameter file, the Field parameter group can contain parameter
+    subgroups named after the defined fields. These subgroups can contain
+    details about a field's centering or its membership in field groups.
+
+    The resulting generator iterator yields a 2-element tuple defined field.
+    The first element indicates the field name while the second is a dict. If
+    it was specified, the information in the subgroup can be found in the dict
+    """
+    field_group = parameters.get("Field",[])
+    for field in field_group.get('list',[]):
+        subgroup = field_group.get(field,{})
+
+        # accounts for the potential collision of having a "gamma" field and
+        # assigning "gamma" a scalar value
+        if (field == 'gamma') and (not isinstance(subgroup,dict)):
+            subgroup = {}
+        yield field,subgroup
