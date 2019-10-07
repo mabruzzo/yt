@@ -39,6 +39,8 @@ from yt.funcs import \
     setdefaultattr
 from yt.geometry.grid_geometry_handler import \
     GridIndex
+from yt.units.yt_array import \
+    YTArray
 from yt.utilities.cosmology import \
     Cosmology
 from yt.utilities.logger import \
@@ -404,7 +406,6 @@ class EnzoPDataset(Dataset):
         else:
             self.cosmological_simulation = 0
 
-
         fh = h5py.File(os.path.join(self.directory, fn0), "r")
         self.domain_left_edge  = fh.attrs["lower"]
         self.domain_right_edge = fh.attrs["upper"]
@@ -419,6 +420,10 @@ class EnzoPDataset(Dataset):
         self.active_grid_dimensions = gei - gsi + 1
         self.grid_dimensions = ablock.attrs["enzo_GridDimension"]
         self.domain_dimensions = root_blocks * self.active_grid_dimensions
+        self.frame_velocity = ablock.attrs.get("frame_velocity",
+                                               np.zeros((3,), np.float32))
+        self.origin_offset  = ablock.attrs.get("origin_offset",
+                                               np.zeros((3,), np.float32))
         fh.close()
 
         if self.cosmological_simulation:
@@ -467,6 +472,13 @@ class EnzoPDataset(Dataset):
         magnetic_unit = np.float64(magnetic_unit.in_cgs())
         setdefaultattr(self, 'magnetic_unit',
                        self.quan(magnetic_unit, "gauss"))
+
+    def _set_derived_attrs(self):
+        Dataset._set_derived_attrs(self)
+        if not isinstance(self.frame_velocity, YTArray):
+            self.frame_velocity = self.arr(self.frame_velocity, "code_velocity")
+        if not isinstance(self.origin_offset, YTArray):
+            self.origin_offset = self.arr(self.origin_offset, "code_length")
 
     def __repr__(self):
         return self.basename[:-len(self._suffix)]
