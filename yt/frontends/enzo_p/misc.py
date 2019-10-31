@@ -125,7 +125,8 @@ def nested_dict_get(pdict, keys, default=None):
         val = default
     return val
 
-def field_subgroup_generator(parameters):
+
+def field_subgroup_generator(parameters, only_existing = False):
     """
     Create an iterator for the field subgroups in the parameter file.
 
@@ -136,13 +137,40 @@ def field_subgroup_generator(parameters):
     The resulting generator iterator yields a 2-element tuple defined field.
     The first element indicates the field name while the second is a dict. If
     it was specified, the information in the subgroup can be found in the dict
+
+    If only_existing is True, tuples are only be yielded for fields with
+    associated specified subgroups. When False, tuples are yielded for all
+    fields (empty dictionaries are used for fields without subgroups).
     """
     field_group = parameters.get("Field",[])
     for field in field_group.get('list',[]):
-        subgroup = field_group.get(field,{})
+        subgroup = field_group.get(field, None)
 
         # accounts for the potential collision of having a "gamma" field and
         # assigning "gamma" a scalar value
         if (field == 'gamma') and (not isinstance(subgroup,dict)):
-            subgroup = {}
+            subgroup = None
+
+        if subgroup is None:
+            if only_existing:
+                continue #skip over this field
+            else:
+                subgroup = {}
+
         yield field,subgroup
+
+def group_field_members(parameters, group_name):
+    """
+    Returns a set containing the members of the specified group.
+    """
+    # check within the Group parameter group.
+    # Group : <group_name> : field_list
+    out = set(nested_dict_get(group_name, (group_name, 'field_list'),
+                              default = []))
+
+    # iterate over field ubgroups and check the group_list parameter
+    # Field : <field_name> : group_list
+    for field, subgroup in field_subgroup_generator(parameters, True):
+        if group_name in subgroup.get('group_list',[]):
+            out.add(field)
+    return out
