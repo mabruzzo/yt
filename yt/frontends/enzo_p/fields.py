@@ -13,12 +13,16 @@ Fields specific to Enzo-P
 # The full license is in the file COPYING.txt, distributed with this software.
 #-----------------------------------------------------------------------------
 import numpy as np
+import warnings
 from yt.fields.field_info_container import \
     FieldInfoContainer
 from yt.fields.particle_fields import \
     add_union_field
 from yt.frontends.enzo_p.misc import \
     nested_dict_get, field_subgroup_generator
+from yt.utilities.physical_constants import \
+    kboltz
+
 
 rho_units = "code_mass / code_length**3"
 vel_units = "code_velocity"
@@ -107,12 +111,35 @@ class EnzoPFieldInfo(FieldInfoContainer):
                 msg = 'expected "{}" to have {} centering, not [0,0,0].'
                 raise ValueError(msg.format(field_name,str(expected_flags)))
 
+    def has_multi_species(self):
+        # when full-support is implemented for multi-species this method should
+        # be removed
+        species_fields = frozenset(["HI_density", "HII_density", "HM_density",
+                                    "HeI_density", "HeII_density",
+                                    "HeIII_density", "H2I_density",
+                                    "H2II_density", "DI_density",
+                                    "DII_density", "HDI_density", "e_density"])
+        for field_name, _ in field_subgroup_generator(self.ds.parameters):
+            if field_name in species_fields:
+                warnings.warn(
+                    "Support for species fields has not yet been implemented "
+                    "for Enzo-P.")
+                return True
+        return False
+
     def setup_fluid_fields(self):
         from yt.fields.magnetic_field import \
             setup_magnetic_field_aliases
         self.setup_energy_field()
         setup_magnetic_field_aliases(self, "enzop",
                                      ["bfield_%s" % ax for ax in "xyz"])
+
+        if not self.has_multi_species():
+            def _number_density(field, data):
+                return data["pressure"]/(data["temperature"] * kboltz)
+            self.add_field(("gas", "number_density"), sampling_type="cell",
+                           function = _number_density,
+                           units = self.ds.unit_system["number_density"])
 
     def setup_energy_field(self):
         unit_system = self.ds.unit_system
