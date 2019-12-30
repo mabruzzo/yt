@@ -83,8 +83,12 @@ class EnzoPFieldInfo(FieldInfoContainer):
                     msg = 'expected "{}" to have {!s} centering, not {!s}.'
                     raise ValueError(msg.format(field_name,expected_flags,
                                                 nodal_flags))
-                finfo = self['enzop', field_name]
-                finfo.nodal_flag = np.array(nodal_flags)
+
+                # if the simulation actually saved the current field to disk
+                # and it is now loaded in memory, setup the nodal flags
+                if ('enzop', field_name) in self:
+                    finfo = self['enzop', field_name]
+                    finfo.nodal_flag = np.array(nodal_flags)
 
             elif ((expected_flags is not None)
                   and (expected_flags != np.array([0,0,0])).any()):
@@ -121,15 +125,19 @@ class EnzoPFieldInfo(FieldInfoContainer):
                            function = _number_density,
                            units = self.ds.unit_system["number_density"])
 
+    def uses_dual_energy_formalism(self):
+        for name in ["ppm", "mhd_vlct"]:
+            param = nested_dict_get(self.ds.parameters, ('Method', name), None)
+            if ((param is not None) and param.get("dual_energy",False)):
+                return True
+        return False
+
     def setup_energy_field(self):
         unit_system = self.ds.unit_system
 
-        ppm_param = self.ds.parameters.get("ppm",None)
-        dual_energy =  ((ppm_param is not None)
-                        and ppm_param.get("dual_energy",False))
-        if dual_energy:
+        # identify if the dual energy formalism is in use:
+        if self.uses_dual_energy_formalism():
             self.alias(("gas", "thermal_energy"), ("enzop", "internal_energy"))
-
         else:
             # check if we need to include magnetic energy
             has_magnetic = ('bfield_x' in self.ds.parameters['Field']['list'])
