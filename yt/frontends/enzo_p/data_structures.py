@@ -415,10 +415,15 @@ class EnzoPDataset(Dataset):
         self.active_grid_dimensions = gei - gsi + 1
         self.grid_dimensions = ablock.attrs["enzo_GridDimension"]
         self.domain_dimensions = root_blocks * self.active_grid_dimensions
+
+        # load reference frame details
         self.frame_velocity = ablock.attrs.get("frame_velocity",
                                                np.zeros((3,), np.float32))
-        self.origin_offset  = ablock.attrs.get("origin_offset",
-                                               np.zeros((3,), np.float32))
+        last_origin_offset = ablock.attrs.get('last_updated_origin_offset',
+                                              np.zeros((3,), np.float32))
+        dt = self.current_time - ablock.attrs.get('last_frame_update_time',
+                                                  [0.])[0]
+        self.origin_offset = last_origin_offset + dt * self.frame_velocity
         fh.close()
 
         if self.cosmological_simulation:
