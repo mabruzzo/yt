@@ -11,6 +11,28 @@ class ChollaIOHandler(BaseIOHandler):
         raise NotImplementedError
 
     def _read_particle_fields(self, chunks, ptf, selector):
+        for chunk in chunks:
+            f = None
+            for grid in chunk.objs:
+                if grid.particle_filename is None:
+                    continue
+                if f is None:
+                    f = h5py.File(grid.filename, mode="r")
+                # not sure if this makes sense in context of cholla
+                if grid.particle_count is None:
+                    grid.particle_count = f.attrs['n_particles_local']
+                if grid.particle_count == 0:
+                    continue
+                for ptype, field_list in sorted(ptf.items()):
+                    if 'pos_x' in f.keys():
+                        pos_prefix = 'pos_'
+                    else:
+                        pos_prefix = ''
+                    coords = tuple(
+                        np.asarray(f.get(f'{pos_prefix}_{ax}')[()], dtype="=f8")
+                        for ax in "xyz"[: self.ds.dimensionality]
+                    )
+
         raise NotImplementedError
 
     def io_iter(self, chunks, fields):

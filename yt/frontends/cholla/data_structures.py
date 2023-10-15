@@ -1,4 +1,5 @@
 import os
+import warnings
 import weakref
 
 import numpy as np
@@ -44,15 +45,50 @@ def _split_fname_proc_suffix(filename: str):
         return (filename[:sep_i], filename[sep_i + 1 :])
 
 
+def _infer_particle_fname_template(hydro_fname_0: str):
+    """
+    Try to infer a string-template for which str.format(id = gridID) gives the
+    path to the file containing Cholla particle information.
+
+    Cholla currently saves particles to a separate filename. As a rule of thumb,
+    if `hydro_fname_0`, the path to the file containing grid 0, is
+    '<prefix>.h5.0' the corresponding particle-file is
+    '<prefix>_particles.h5.0'.
+
+    Likewise, if the hydro-data was concatenated and `hydro_fname_0` is
+    '<prefix>.h5.0', then the corresponding concatenated particle-file is
+    '<prefix>_particles.h5'.
+
+    This returns None, if files can't be confidently inferred (note, it's
+    possible the dataset did not save any particle data).
+    """
+    ind = hydro_fname_0.rfind('.h5')
+    if (ind == -1) or (hydro_fname_0[ind:] not in ('.h5.0', '.h5')):
+        warnings.warn('Skipping search for cholla particle files')
+        return None
+
+    template = f'{hydro_fname_0[:ind]}_particles.h5'
+    if hydro_fname_0[-2:] == '.0':
+        template += '.{id:d}'
+
+    if os.path.isfile(template.format(id = 0)):
+        return template
+    else:
+        # we end up returning None if the particle-files were concatenated
+        # and the hydro-files were not (or vice-versa). This is ok for now
+        return None
+
+
 class ChollaGrid(AMRGridPatch):
     _id_offset = 0
 
-    def __init__(self, id, index, level, dims, filename):
+    def __init__(self, id, index, level, dims, filename, particle_filename):
         super().__init__(id, filename=filename, index=index)
         self.Parent = None
         self.Children = []
         self.Level = level
         self.ActiveDimensions = dims
+        self.particle_filename = particle_filename
 
 
 class ChollaHierarchy(GridIndex):
@@ -71,6 +107,20 @@ class ChollaHierarchy(GridIndex):
     def _detect_output_fields(self):
         with h5py.File(self.index_filename, mode="r") as h5f:
             self.field_list = [("cholla", k) for k in h5f.keys()]
+
+        # this function is always called after self._parse_index() &
+        # self._populate_grid_objects(). Thus self.grids is initialized
+        if False and self.grids[0].particle_filename is not None:
+            with h5py.File(self.index_filename, mode="r") as h5f:
+                shape = (h5f.attrs['n_particles_local'],)
+                for k,dset in hf5:
+                    if dset.shape != shape: # exclude projected density
+                        continue
+                    if k in 'xyz':
+                        # historical pos_x,pos_y,pos_z were shortened to
+                        # x,y,z during concatenation
+                        k = f'pos_{k}'
+                    self.field_list.append(('io',k))
 
     def _count_grids(self):
         # the number of grids is equal to the number of processes, unless the
@@ -109,6 +159,10 @@ class ChollaHierarchy(GridIndex):
 
             ind_fname_pairs = ((i, f"{pref}.{i}") for i in range(self.num_grids))
 
+        particle_fname_fmt_template = _infer_particle_fname_template(
+            self.index_filename
+        )
+
         dims_global = self.ds.domain_dimensions[:]
         pbar = get_pbar("Parsing Hierarchy", self.num_grids)
 
@@ -131,12 +185,18 @@ class ChollaHierarchy(GridIndex):
 
             level = 0
 
+            if particle_fname_fmt_template is not None:
+                particle_filename = particle_fname_fmt_template.format(id = i)
+            else:
+                particle_filename = None
+
             self.grids[i] = self.grid(
                 i,
                 index=self,
                 level=level,
                 dims=dims_local,
                 filename=self.index_filename,
+                particle_filename=particle_filename
             )
 
             self.grid_left_edge[i] = left_frac
