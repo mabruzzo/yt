@@ -9,11 +9,12 @@ from yt.utilities.physical_constants import kboltz, mh
 pres_units = "code_pressure"
 erg_units = "code_mass * (code_length/code_time)**2"
 rho_units = "code_mass / code_length**3"
+vel_units = "code_length / code_time"
 mom_units = "code_mass / code_length**2 / code_time"
 
 
 def velocity_field(comp):
-    def _velocity(data):
+    def _velocity(field, data):
         return data["cholla", f"momentum_{comp}"] / data["cholla", "density"]
 
     return _velocity
@@ -32,7 +33,18 @@ class ChollaFieldInfo(FieldInfoContainer):
         ("metal_density", (rho_units, ["metal_density"], None)),
     )
 
-    known_particle_fields = ()
+    known_particle_fields: KnownFieldsT = (
+        ("pos_x", ("code_length", ["particle_position_x"], None)),
+        ("pos_y", ("code_length", ["particle_position_y"], None)),
+        ("pos_z", ("code_length", ["particle_position_z"], None)),
+        ("vel_x", (vel_units, ["particle_velocity_x"], None)),
+        ("vel_y", (vel_units, ["particle_velocity_y"], None)),
+        ("vel_z", (vel_units, ["particle_velocity_z"], None)),
+        ("mass", ("code_mass", ["particle_mass"], None)),
+        ("particle_IDs", ("", ["particle_index"], None)),
+        # todo: we really want to rename the following creation_time (age is wrong)
+        ("age", ("code_time", [], None)),
+    )
 
     # In Cholla, conservative variables are written out.
 
@@ -59,12 +71,12 @@ class ChollaFieldInfo(FieldInfoContainer):
                 units=unit_system["pressure"],
             )
 
-            def _pressure(data):
+            def _pressure(field, data):
                 return (data.ds.gamma - 1.0) * data["cholla", "GasEnergy"]
 
         else:
 
-            def _pressure(data):
+            def _pressure(field, data):
                 return (data.ds.gamma - 1.0) * (
                     data["cholla", "Energy"] - data["gas", "kinetic_energy_density"]
                 )
@@ -76,7 +88,7 @@ class ChollaFieldInfo(FieldInfoContainer):
             units=unit_system["pressure"],
         )
 
-        def _specific_total_energy(data):
+        def _specific_total_energy(field, data):
             return data["cholla", "Energy"] / data["cholla", "density"]
 
         self.add_field(
@@ -89,7 +101,7 @@ class ChollaFieldInfo(FieldInfoContainer):
         # Add temperature field
         if hasattr(self.ds, "mu"):
 
-            def _temperature(data):
+            def _temperature(field, data):
                 return (
                     data.ds.mu
                     * data["gas", "pressure"]
@@ -113,7 +125,7 @@ class ChollaFieldInfo(FieldInfoContainer):
                 units=rho_units,
             )
 
-            def _color(data):
+            def _color(field, data):
                 return data["cholla", "scalar0"] / data["cholla", "density"]
 
             self.add_field(
@@ -132,7 +144,7 @@ class ChollaFieldInfo(FieldInfoContainer):
             # Using color field to define metallicity field, where a color of 1
             # indicates solar metallicity
 
-            def _metallicity(data):
+            def _metallicity(field, data):
                 # Ensuring that there are no negative metallicities
                 return np.clip(data["cholla", "color"], 0, np.inf) * Zsun
 

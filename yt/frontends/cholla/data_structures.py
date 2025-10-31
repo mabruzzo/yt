@@ -3,6 +3,7 @@ import weakref
 
 import numpy as np
 
+from yt._typing import ParticleType
 from yt.data_objects.index_subobjects.grid_patch import AMRGridPatch
 from yt.data_objects.static_output import Dataset
 from yt.funcs import setdefaultattr
@@ -12,18 +13,19 @@ from yt.utilities.logger import ytLogger as mylog
 from yt.utilities.on_demand_imports import _h5py
 
 from .fields import ChollaFieldInfo
-from .misc import _determine_data_layout
+from .misc import _detect_particle_fields, _determine_data_layout
 
 
 class ChollaGrid(AMRGridPatch):
     _id_offset = 0
 
-    def __init__(self, id, index, level, dims, filename):
+    def __init__(self, id, index, level, dims, filename, particle_filename=None):
         super().__init__(id, filename=filename, index=index)
         self.Parent = None
         self.Children = []
         self.Level = level
         self.ActiveDimensions = dims
+        self.particle_filename = particle_filename
 
 
 class ChollaHierarchy(GridIndex):
@@ -41,9 +43,25 @@ class ChollaHierarchy(GridIndex):
         super().__init__(ds, dataset_type)
 
     def _detect_output_fields(self):
-        with _h5py.File(self.index_filename, mode="r") as h5f:
-            grp = h5f.get("field", h5f)
-            self.field_list = [("cholla", k) for k in grp.keys()]
+        # importantly, this is called after ``_count_grids`` & ``_parse_index``
+
+        # Do this only on the root processor to save disk work (this is what the Enzo-E
+        # frontend does)
+        if self.comm.rank in (0, None):
+            print(self.index_filename)
+            with _h5py.File(self.index_filename, mode="r") as h5f:
+                grp = h5f.get("field", h5f)
+                _field_list = [("cholla", k) for k in grp.keys()]
+            _field_list.extend(_detect_particle_fields(self._block_mapping))
+        else:
+            _field_list = None
+        self.field_list = list(self.comm.mpi_bcast(_field_list))
+
+        # we are following the convention of the Enzo-E frontend and setting particle
+        # types right here. If we want to do it sooner, (before fully initializing the
+        # ChollaHierarchy instance), that will involve some refactoring
+        self.dataset.particle_types = self._block_mapping.particle_types
+        self.dataset.particle_types_raw = self._block_mapping.particle_types
 
     def _count_grids(self):
         with _h5py.File(self.index_filename, "r") as f:
@@ -51,6 +69,17 @@ class ChollaHierarchy(GridIndex):
         self.num_grids = self._blockid_location_arr.size
 
     def _parse_index(self):
+        # fill in self.grid_left_edge, self.grid_right_edge, self.grid_particle_count,
+        # self.grid_dimensions and self.grid_levels
+
+        # first, handle everything other than self.grid_particle_count
+        if self._block_mapping.particle_fname_template is not None:
+            _get_particle_fname = self._block_mapping.particle_fname_template.format
+        else:
+
+            def _get_particle_fname(blockid):
+                return None
+
         self.grids = np.empty(self.num_grids, dtype="object")
 
         shape_arr = np.array(self._blockid_location_arr.shape)
@@ -64,24 +93,45 @@ class ChollaHierarchy(GridIndex):
             level = 0
 
             self.grids[blockid] = self.grid(
-                blockid,
+                id=blockid,
                 index=self,
                 level=level,
                 dims=dims_local,
                 filename=self._block_mapping.fname_template.format(blockid=blockid),
+                particle_filename=_get_particle_fname(blockid=blockid),
             )
 
             self.grid_left_edge[blockid, :] = left_frac
             self.grid_right_edge[blockid, :] = right_frac
             self.grid_dimensions[blockid, :] = dims_local
             self.grid_levels[blockid, 0] = level
-            self.grid_particle_count[blockid, 0] = 0
 
         slope = self.ds.domain_width / self.ds.arr(np.ones(3), "code_length")
         self.grid_left_edge = self.grid_left_edge * slope + self.ds.domain_left_edge
         self.grid_right_edge = self.grid_right_edge * slope + self.ds.domain_left_edge
 
         self.max_level = 0
+
+        # now, deal with initializing self.grid_particle_count
+        if len(self._block_mapping.particle_types) == 0:
+            self.grid_particle_count[()] = 0
+        else:
+            # It's unfortunate that we need to go through and count up all of the
+            # particles. To try to mitigate the cost, lets only do it on the root
+            # processor to save disk work
+            # -> in the future, we might be able to adjust Cholla's file format to
+            #    reduce this cost
+            # -> the Enzo-E frontend appears to entirely skip initializing the
+            #    self.grid_particle_count arrays (and I think it loads the data as it
+            #    becomes needed)
+            if self.comm.rank in (0, None):
+                for g in self.grids:
+                    with _h5py.File(g.particle_filename, "r") as f:
+                        n_particles = f.attrs["n_particles_local"][0]
+                        self.grid_particle_count[g.id, 0] = n_particles
+            else:
+                pass
+            self.grid_particle_count = self.comm.mpi_bcast(self.grid_particle_count)
 
     def _populate_grid_objects(self):
         for i in range(self.num_grids):
@@ -91,9 +141,17 @@ class ChollaHierarchy(GridIndex):
 
 
 class ChollaDataset(Dataset):
+    """
+    Cholla-specific output, set at a fixed time.
+    """
+
+    # set class variable values:
     _load_requirements = ["h5py"]
     _index_class = ChollaHierarchy
     _field_info_class = ChollaFieldInfo
+    # set default instance variable values:
+    particle_types: tuple[ParticleType, ...] = ()
+    particle_types_raw: tuple[ParticleType, ...] | None = None
 
     def __init__(
         self,

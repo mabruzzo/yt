@@ -1,3 +1,4 @@
+import enum
 import os
 import typing
 from collections import defaultdict
@@ -5,6 +6,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
+
+from yt._typing import ParticleType
+from yt.utilities.logger import ytLogger as mylog
 
 # this is a hacky workaround to get _h5py.File to work in annotations. We can probably
 # address this issue more robustly by directly modifying yt.utilities.on_demand_imports
@@ -48,6 +52,34 @@ class _CachedH5Openner:
             self._fh.close()
 
 
+class ChollaDataFmt(enum.Enum):
+    """Describes the format of the grid data"""
+
+    # the format directly written by Cholla (each block is written to a separate file)
+    DISTRIBUTED = (enum.auto(), False)
+    # Cholla's older concatenation scripts (that are no longer available), would
+    # combine all blocks into 1 giant block. The resulting generally appears as if
+    # Cholla was run with a single process that evolved a single giant block of data
+    LEGACY_CONCAT = (enum.auto(), True)
+    # Cholla's newer concatenation scripts combine all of the data into a single file,
+    # but retains the original block structure
+    CONCAT = (enum.auto(), True)
+
+    def __new__(cls, value: typing.Any, is_single_file: bool):
+        # based on example from docs
+        if isinstance(value, enum.auto):
+            value = len(cls.__members__) + 1
+
+        obj = object.__new__(cls)
+        obj._value_ = value
+        obj.is_single_file = is_single_file
+        return obj
+
+    def __repr__(self):
+        # based on example from docs (when we want to hide the underlying value)
+        return f"<{self.__class__.__name__}, {self.name}>"
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class _BlockDiskMapping:
     """Contains info for mapping blockids to locations in hdf5 files
@@ -66,6 +98,91 @@ class _BlockDiskMapping:
     h5_group: str
     # maps blockid to an index that select all associated data from a field-dataset
     idx_map: Mapping[int, tuple[int | slice, ...]]
+
+    # ``particle_fname_template`` is ``None`` or a string for which
+    # ``particle_fname_template.format(blockid=...)`` produces the file containing
+    # particles for the specified blockid
+    # -> at the time of writing, the particle data is never in the same file as hydro
+    #    data, but that could change in the future
+    particle_fname_template: str | None
+    particle_types: tuple[ParticleType, ...]
+
+
+def _infer_particle_fname_template_and_types(
+    block0_fluid_fname: str, fluid_data_fmt: ChollaDataFmt
+) -> tuple[str | None, tuple[ParticleType, ...]]:
+    """
+    Try to infer the fname template for loading particle data.
+
+    Parameters
+    ----------
+    block0_fluid_fname: str
+        Specifies the path to the file containing fluid for blockid 0. (This
+        should always be the same as the file that was passed to ``yt.load``).
+    fluid_data_fmt: ChollaDataFmt
+        The format of the fluid data in the Cholla dataset.
+
+    Returns
+    -------
+    particle_fname_template: str or None
+        This will be None if the template can't be inferred or there aren't
+        any files at the expected locations.
+    particle_types: tuple of strings
+        Specify the kinds of particles included in the dataset
+    """
+    # we try to be very explicit why we end/skip the search for particle data
+    # (to be transparent to end-users)
+    match fluid_data_fmt:
+        case ChollaDataFmt.LEGACY_CONCAT:
+            mylog.info(
+                "Skipping check for particle-data when reading data with Cholla's "
+                "legacy concatenation format"
+            )
+            # the fundamental problem stems from the way that Cholla's legacy fluid
+            # concatenation script combines all blocks into 1 giant block.
+            # - technically, Cholla had legacy concatenation scripts that did the same
+            #   thing for particle-data. But, to my knowledge nobody ever used those
+            #   scripts for particle datasets (so we don't support it)
+            # - The only supported way of loading particle-data retains the block
+            #   structure. While we could support this mismatch of particle and fluid
+            #   data, it would involve a lot of work (and I don't think it will ever
+            #   actually come up in the real world)
+            return None, ()
+        case ChollaDataFmt.CONCAT:
+            expected_suffix = ".h5"
+        case ChollaDataFmt.DISTRIBUTED:
+            expected_suffix = ".h5.0"
+        case _:
+            raise RuntimeError("should be unreachable")
+
+    suf_len = len(expected_suffix)
+    min_basename_len = suf_len + 1
+
+    if not block0_fluid_fname.endswith(expected_suffix):
+        mylog.info(
+            "Skip check for particle-data: the path to the fluid data file "
+            "(containing data for blockid 0) doesn't have the expected suffix, "
+            f"{expected_suffix!r} (for the {fluid_data_fmt.name} format)"
+        )
+        return None, ()
+    elif (
+        (len(block0_fluid_fname) < min_basename_len)
+        or (block0_fluid_fname[-min_basename_len] == os.sep)
+        or (block0_fluid_fname[-min_basename_len] == os.altsep)
+    ):
+        mylog.info(
+            "Skip check for particle-data: the basename of the fluid data file "
+            f"doesn't contain any characters before the {expected_suffix!r} suffix"
+        )
+        return None, ()
+    template = f"{block0_fluid_fname[:-suf_len]}_particles.h5.{{blockid:d}}"
+
+    if not os.path.isfile(template.format(blockid=0)):
+        mylog.info("No particle data was found")
+        return None, ()
+
+    # at the time of writing there is only a single particle type
+    return template, ("io",)
 
 
 def _infer_blockid_location_arr(fname_template, global_dims, arr_shape):
@@ -92,7 +209,7 @@ def _determine_data_layout(f: _h5py.File) -> tuple[np.ndarray, _BlockDiskMapping
 
     The premise is that the basic different data formats shouldn't
     matter outside of this function."""
-    filename = f.filename
+    filename = os.fsdecode(f.filename)
 
     # STEP 1: infer the template for all Cholla data-files by inspecting filename
     # ===========================================================================
@@ -121,8 +238,9 @@ def _determine_data_layout(f: _h5py.File) -> tuple[np.ndarray, _BlockDiskMapping
             int(blockid): (i, slice(None), slice(None), slice(None))
             for i, blockid in enumerate(f["domain/stored_blockid_list"][...])
         }
-        consolidated_data = len(field_idx_map) == blockid_location_arr.size
-        if not consolidated_data:
+        if len(field_idx_map) == blockid_location_arr.size:
+            data_fmt = ChollaDataFmt.CONCAT
+        else:
             # in the near future, we may support one of the 2 cases:
             # > if (flat_structure):
             # >     _common_idx = (slice(None), slice(None), slice(None))
@@ -144,7 +262,10 @@ def _determine_data_layout(f: _h5py.File) -> tuple[np.ndarray, _BlockDiskMapping
             global_dims=f.attrs["dims"].astype("=i8"),
             arr_shape=f.attrs.get("nprocs", np.array([1, 1, 1])).astype("=i8"),
         )
-        consolidated_data = blockid_location_arr.size == 1
+        if blockid_location_arr.size == 1:
+            data_fmt = ChollaDataFmt.LEGACY_CONCAT
+        else:
+            data_fmt = ChollaDataFmt.DISTRIBUTED
 
         def _get_common_idx():
             return (slice(None), slice(None), slice(None))
@@ -153,20 +274,31 @@ def _determine_data_layout(f: _h5py.File) -> tuple[np.ndarray, _BlockDiskMapping
 
     # STEP 4: Finalize the fname template
     # ===================================
-    if consolidated_data:
-        fname_template = filename
-    elif cur_filename_suffix != 0:
-        raise ValueError(  # mostly just a sanity check!
-            "filename passed to yt.load for a distributed cholla dataset must "
-            "end in '.0'"
-        )
-    else:
-        fname_template = inferred_fname_template
+    match data_fmt:
+        case ChollaDataFmt.LEGACY_CONCAT | ChollaDataFmt.CONCAT:
+            fname_template = filename
+        case ChollaDataFmt.DISTRIBUTED:
+            if cur_filename_suffix != 0:
+                raise ValueError(  # mostly just a sanity check!
+                    "filename passed to yt.load for a distributed cholla dataset must "
+                    "end in '.0'"
+                )
+            fname_template = inferred_fname_template
+        case _:
+            raise RuntimeError("should be unreachable")
+
+    # STEP 5: Check if there is a particle dataset
+    # ============================================
+    particle_fname_template, particle_types = _infer_particle_fname_template_and_types(
+        block0_fluid_fname=filename, fluid_data_fmt=data_fmt
+    )
 
     mapping = _BlockDiskMapping(
         fname_template=fname_template,
         h5_group="./" if flat_structure else "field",
         idx_map=field_idx_map,
+        particle_fname_template=particle_fname_template,
+        particle_types=particle_types,
     )
     return blockid_location_arr, mapping
 
@@ -212,3 +344,28 @@ def _infer_fname_template(filename: str) -> tuple[str, int | None]:
             return os.path.join(_dir, f"{prefix}.{{blockid}}"), int(suffix)
         case _:
             return (filename, None)
+
+
+def _detect_particle_fields(
+    data_mapping: _BlockDiskMapping,
+) -> list[tuple[ParticleType, str]]:
+    # we insert a few assert statements to flag areas of code that need to be changed
+    # if/when we add support for more particle-types
+
+    if len(data_mapping.particle_types) == 0:
+        return []
+    assert data_mapping.particle_types == ("io",)
+    ptype = data_mapping.particle_types[0]
+
+    path = data_mapping.particle_fname_template.format(blockid=0)
+    with _h5py.File(path, mode="r") as h5f:
+        local_pfield_shape = (h5f.attrs["n_particles_local"][0],)
+        out = []
+        for name, dataset in h5f.items():
+            assert isinstance(dataset, _h5py.Dataset)
+            if dataset.shape != local_pfield_shape:
+                # ensures that we don't include "density," which is a 3D field
+                # holding density deposition
+                continue
+            out.append((ptype, name))
+        return out

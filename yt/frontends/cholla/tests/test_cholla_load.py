@@ -15,7 +15,6 @@ In more detail, Cholla has had a couple of historical data formats.
     between the 2 packages
 """
 
-import enum
 import typing
 from collections.abc import Sequence
 
@@ -23,7 +22,7 @@ import numpy as np
 import pytest
 
 import yt
-from yt.frontends.cholla.misc import _CachedH5Openner
+from yt.frontends.cholla.misc import ChollaDataFmt, _CachedH5Openner
 from yt.testing import requires_module
 
 # this is a hacky workaround to get h5py.File to work in annotations. We can probably
@@ -32,34 +31,6 @@ if typing.TYPE_CHECKING:
     import h5py
 else:
     from yt.utilities.on_demand_imports import _h5py as h5py
-
-
-class ChollaDataFmt(enum.Enum):
-    """Describes the format of the grid data"""
-
-    # the format directly written by Cholla (each block is written to a separate file)
-    DISTRIBUTED = (enum.auto(), False)
-    # Cholla's older concatenation scripts (that are no longer available), would
-    # combine all blocks into 1 giant block. The resulting generally appears as if
-    # Cholla was run with a single process that evolved a single giant block of data
-    LEGACY_CONCAT = (enum.auto(), True)
-    # Cholla's newer concatenation scripts combine all of the data into a single file,
-    # but retains the original block structure
-    CONCAT = (enum.auto(), True)
-
-    def __new__(cls, value: typing.Any, is_single_file: bool):
-        # based on example from docs
-        if isinstance(value, enum.auto):
-            value = len(cls.__members__) + 1
-
-        obj = object.__new__(cls)
-        obj._value_ = value
-        obj.is_single_file = is_single_file
-        return obj
-
-    def __repr__(self):
-        # based on example from docs (when we want to hide the underlying value)
-        return f"<{self.__class__.__name__}, {self.name}>"
 
 
 def _generate_array(shape: tuple[int, ...], *, start: int = 0):
