@@ -58,7 +58,7 @@ class ChollaIOHandler(BaseIOHandler):
 
                     assert obj.particle_filename is not None  # sanity check!
 
-                    fh = h5_context_manager.load_fh(obj.particle_filename)
+                    fh = h5_context_manager.open_fh(obj.particle_filename)
 
                     for ptype, field_list in sorted(ptf.items()):
                         if ptype != "io":  # sanity check
