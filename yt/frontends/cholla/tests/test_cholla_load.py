@@ -17,6 +17,7 @@ In more detail, Cholla has had a couple of historical data formats.
 
 import typing
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import pytest
@@ -31,6 +32,14 @@ if typing.TYPE_CHECKING:
     import h5py
 else:
     from yt.utilities.on_demand_imports import _h5py as h5py
+
+
+@dataclass(frozen=True)
+class DomainInfo:
+    """Characterizes the domain of the synthetic simulation"""
+
+    domain_left_edge_kpc: tuple[float, float, float]
+    domain_width_kpc: tuple[float, float, float]
 
 
 def _generate_array(shape: tuple[int, ...], *, start: int = 0):
@@ -67,20 +76,23 @@ def _add_standard_header_attrs(f: h5py.File):
     f.attrs["dt"] = np.array([0.0], dtype="f8")
 
 
-def _write_domain_prop_attrs(f: h5py.File, global_shape: tuple[int, ...]):
-    # we could customize this quite a bit... (but, that seems unnecessary)
+def _write_domain_prop_attrs(
+    f: h5py.File, global_shape: tuple[int, ...], domain_info: DomainInfo
+):
+    # reminder, Cholla's code-length is 1 kpc
+    domain = np.array(domain_info.domain_width_kpc, dtype="f8")
+    bounds = np.array(domain_info.domain_left_edge_kpc, dtype="f8")
 
-    dx = np.array([1.0 for _ in global_shape])
-    domain = dx * global_shape
-    f.attrs["dx"] = dx
+    f.attrs["dx"] = domain / np.array(global_shape)
     f.attrs["domain"] = domain
-    f.attrs["bounds"] = -0.25 * domain
+    f.attrs["bounds"] = bounds
 
 
 def _generate_files(
     root_path: str,
     nprocs: Sequence[int],
     global_shape: Sequence[int],
+    domain_info: DomainInfo,
     *,
     data_format: ChollaDataFmt | None = None,
     field_names: Sequence[str] | None = None,
@@ -226,7 +238,9 @@ def _generate_files(
                 f.attrs["nprocs"] = np.array(nprocs)
                 f.attrs["n_fields"] = np.array([len(field_names)])
                 _add_standard_header_attrs(f)
-                _write_domain_prop_attrs(f, global_shape=global_shape)
+                _write_domain_prop_attrs(
+                    f, global_shape=global_shape, domain_info=domain_info
+                )
                 # create the datasets that will hold the fields
                 for field_name in field_names:
                     f[field_grp].create_dataset(
@@ -239,21 +253,29 @@ def _generate_files(
     return global_arrays, fname_template.format(blockid=0)
 
 
+_SIMPLE_DOMAIN_PROPS = DomainInfo(
+    domain_left_edge_kpc=(-25.0, -25.0, -25.0), domain_width_kpc=(100.0, 100.0, 100.0)
+)
+
+
 _CASES = [
     {
         "nprocs": (1, 1, 1),
         "global_shape": (8, 8, 8),
         "data_format": ChollaDataFmt.DISTRIBUTED,
+        "domain_info": _SIMPLE_DOMAIN_PROPS,
     },
     {
         "nprocs": (2, 2, 2),
         "global_shape": (4, 16, 8),
         "data_format": ChollaDataFmt.DISTRIBUTED,
+        "domain_info": _SIMPLE_DOMAIN_PROPS,
     },
     {
         "nprocs": (1, 4, 2),
         "global_shape": (4, 16, 8),
         "data_format": ChollaDataFmt.DISTRIBUTED,
+        "domain_info": _SIMPLE_DOMAIN_PROPS,
     },
     # there no point going through lots of varieties of ChollaDataFmt.LEGACY_CONCAT
     # -> the files always look very similar to each other
@@ -261,6 +283,7 @@ _CASES = [
         "nprocs": (2, 2, 2),
         "global_shape": (4, 16, 8),
         "data_format": ChollaDataFmt.LEGACY_CONCAT,
+        "domain_info": _SIMPLE_DOMAIN_PROPS,
     },
     # it's definitely worth checking ChollaDataFmt.LEGACY_CONCAT when there is only
     # 1 process as well as when there are multiple processes
@@ -268,11 +291,13 @@ _CASES = [
         "nprocs": (1, 1, 1),
         "global_shape": (8, 8, 8),
         "data_format": ChollaDataFmt.CONCAT,
+        "domain_info": _SIMPLE_DOMAIN_PROPS,
     },
     {
         "nprocs": (2, 2, 2),
         "global_shape": (4, 16, 8),
         "data_format": ChollaDataFmt.CONCAT,
+        "domain_info": _SIMPLE_DOMAIN_PROPS,
     },
 ]
 
