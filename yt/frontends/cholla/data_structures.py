@@ -155,7 +155,7 @@ class ChollaHierarchy(GridIndex):
                         n_particles = f.attrs["n_particles_local"][0]
                     self.grid_particle_count[g.id, 0] = n_particles
             else:
-                pass
+                pass  # do nothing
             self.grid_particle_count = self.comm.mpi_bcast(self.grid_particle_count)
 
     def _populate_grid_objects(self):

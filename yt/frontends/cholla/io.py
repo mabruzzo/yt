@@ -3,7 +3,7 @@ from typing import Any, TypeAlias
 
 import numpy as np
 
-from yt._typing import ParticleCoordinateTuple, ParticleType
+from yt._typing import FieldKey, ParticleCoordinateTuple, ParticleType
 from yt.utilities.io_handler import BaseIOHandler
 
 from .misc import _CachedH5Openner
@@ -68,7 +68,7 @@ class ChollaIOHandler(BaseIOHandler):
 
                     for ptype, field_list in sorted(ptf.items()):
                         # access HDF5 group containing the datasets of ptype properties
-                        grp = fh[mapper.h5_group.format(ptype=ptype)]
+                        grp = fh[mapper.h5_group_map[ptype]]
 
                         # retrieve the particle positions
                         x, y, z = [grp[f"pos_{ax}"][idx].astype("=f8") for ax in "xyz"]
@@ -85,11 +85,20 @@ class ChollaIOHandler(BaseIOHandler):
                             data = np.asarray(grp[field][idx], "=f8")
                             yield (ptype, field), data[mask]
 
-    def io_iter(self, chunks, fields):
+    def io_iter(
+        self, chunks: Iterable[ChunkT], fields: Sequence[FieldKey]
+    ) -> Iterator[tuple[FieldKey, Any, np.ndarray]]:
         # this is loosely inspired by the implementation used for Enzo/Enzo-E
         # - those other implementations use the lower-level hdf5 interface. Unclear
         #   whether that affords any advantages...
         mapper = self.ds.index._dataset_mapping.field_mapping
+
+        if len(fields) == 0:
+            yield from ()
+            return
+        # peek ahead at the field type
+        common_ftype, _ = fields[0]
+
         with _CachedH5Openner(mode="r") as h5_context_manager:
             for chunk in chunks:
                 for obj in chunk.objs:
@@ -100,12 +109,13 @@ class ChollaIOHandler(BaseIOHandler):
                     fh = h5_context_manager.open_fh(obj.filename)
 
                     # access the HDF5 group containing the datasets of field values
-                    grp = fh[mapper.h5_group]
+                    grp = fh[mapper.h5_group_map[common_ftype]]
                     # get the indices in a generic dataset that correspond to obj.id
                     idx = mapper.idx_map[obj.id]
 
                     for field in fields:
                         ftype, fname = field
+                        assert ftype == common_ftype  # sanity check!
                         yield field, obj, grp[fname][idx].astype("=f8")
 
     def _read_chunk_data(self, chunk, fields):

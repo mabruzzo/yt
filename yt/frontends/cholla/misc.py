@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from yt._typing import ParticleType
+from yt._typing import FieldType, ParticleType
 from yt.utilities.logger import ytLogger as mylog
 
 # this is a hacky workaround to get _h5py.File to work in annotations. We can probably
@@ -82,16 +82,24 @@ class ChollaDataFmt(enum.Enum):
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class _BlockDiskMapping:
-    """Contains info for mapping blockids to locations in hdf5 files.
+    """
+    Contains info for mapping blockids to locations in one or more hdf5 files.
 
-    This is used for accessing field data or particle data.
+    Depending on the context, an instance could be used to track the disk
+    location for mesh field data or particle data from a Cholla simulation.
     """
 
     # ``fname_template.format(blockid=...)`` produces the file containing blockid (this
     # can properly handle cases where all blocks are stored in a single file)
     fname_template: str
-    # hdf5 group containing the field data
-    h5_group: str
+    # ``h5_group_map[field_type]`` produces the hdf5 group containing relevant data.
+    # In more detail, ``field_type`` refers to the first element in a tuple of the form
+    # ``(field_type, field_name)`` that is typically used by yt. The precise details
+    # depend on context:
+    # - in the context of fluid/mesh fields ``field_type`` is the frontend-name
+    #   (i.e. "cholla"), which in yt-convention refers to an on-disk field
+    # - in the case of particle data, ``field_type`` refers to an on-disk particle type
+    h5_group_map: dict[FieldType | ParticleType, str]
     # maps blockid to an index that select all associated data from a field-dataset
     idx_map: Mapping[int, tuple[int | slice, ...]]
 
@@ -179,7 +187,7 @@ def _infer_particle_mapping_and_types(
         ptypes = ("io",)
         particle_mapping = _BlockDiskMapping(
             fname_template=fname_template,
-            h5_group="./",
+            h5_group_map={"io": "./"},
             idx_map=defaultdict(lambda: (slice(None),)),
         )
     elif os.path.isfile(concat_fname):
@@ -194,8 +202,9 @@ def _infer_particle_mapping_and_types(
                 else:
                     start = stop_block_idx_slc[stored_idx - 1]
                 idx_map[blockid] = (slice(start, stop_block_idx_slc[stored_idx]),)
+        h5_group_map = {ptype: f"particle/{ptype}" for ptype in ptypes}
         particle_mapping = _BlockDiskMapping(
-            fname_template=concat_fname, h5_group="particle/{ptype}", idx_map=idx_map
+            fname_template=concat_fname, h5_group_map=h5_group_map, idx_map=idx_map
         )
 
     else:
@@ -309,7 +318,7 @@ def _determine_data_layout(f: _h5py.File) -> tuple[np.ndarray, _DatasetDiskMappi
             raise RuntimeError("should be unreachable")
     field_mapping = _BlockDiskMapping(
         fname_template=fname_template,
-        h5_group="./" if flat_structure else "field",
+        h5_group_map={"cholla": "./" if flat_structure else "field"},
         idx_map=field_idx_map,
     )
 
@@ -383,7 +392,7 @@ def _detect_particle_fields(
 
     path = dset_mapping.particle_mapping.fname_template.format(blockid=0)
     with _h5py.File(path, mode="r") as h5f:
-        grp = h5f[dset_mapping.particle_mapping.h5_group.format(ptype=ptype)]
+        grp = h5f[dset_mapping.particle_mapping.h5_group_map[ptype]]
         if "n_particles_local" in grp.attrs:
             local_pfield_shape = (grp.attrs["n_particles_local"][0],)
         else:
