@@ -52,7 +52,7 @@ class ChollaHierarchy(GridIndex):
             with _h5py.File(self.index_filename, mode="r") as h5f:
                 grp = h5f.get("field", h5f)
                 _field_list = [("cholla", k) for k in grp.keys()]
-            _field_list.extend(_detect_particle_fields(self._block_mapping))
+            _field_list.extend(_detect_particle_fields(self._dataset_mapping))
         else:
             _field_list = None
         self.field_list = list(self.comm.mpi_bcast(_field_list))
@@ -60,25 +60,36 @@ class ChollaHierarchy(GridIndex):
         # we are following the convention of the Enzo-E frontend and setting particle
         # types right here. If we want to do it sooner, (before fully initializing the
         # ChollaHierarchy instance), that will involve some refactoring
-        self.dataset.particle_types = self._block_mapping.particle_types
-        self.dataset.particle_types_raw = self._block_mapping.particle_types
+        self.dataset.particle_types = self._dataset_mapping.particle_types
+        self.dataset.particle_types_raw = self._dataset_mapping.particle_types
 
     def _count_grids(self):
         with _h5py.File(self.index_filename, "r") as f:
-            self._blockid_location_arr, self._block_mapping = _determine_data_layout(f)
+            self._blockid_location_arr, self._dataset_mapping = _determine_data_layout(
+                f
+            )
         self.num_grids = self._blockid_location_arr.size
 
     def _parse_index(self):
         # fill in self.grid_left_edge, self.grid_right_edge, self.grid_particle_count,
         # self.grid_dimensions and self.grid_levels
 
+        _dset_mapping = self._dataset_mapping
+        _p_mapping = self._dataset_mapping.particle_mapping
+
         # first, handle everything other than self.grid_particle_count
-        if self._block_mapping.particle_fname_template is not None:
-            _get_particle_fname = self._block_mapping.particle_fname_template.format
+        if _p_mapping is not None:
+            _get_particle_fname = _p_mapping.fname_template.format
+            _concatenated_particles = (
+                _get_particle_fname(blockid=0) == _p_mapping.fname_template
+            )
         else:
+            _concatenated_particles = False
 
             def _get_particle_fname(blockid):
                 return None
+
+        _get_field_fname = _dset_mapping.field_mapping.fname_template.format
 
         self.grids = np.empty(self.num_grids, dtype="object")
 
@@ -97,7 +108,7 @@ class ChollaHierarchy(GridIndex):
                 index=self,
                 level=level,
                 dims=dims_local,
-                filename=self._block_mapping.fname_template.format(blockid=blockid),
+                filename=_get_field_fname(blockid=blockid),
                 particle_filename=_get_particle_fname(blockid=blockid),
             )
 
@@ -113,8 +124,21 @@ class ChollaHierarchy(GridIndex):
         self.max_level = 0
 
         # now, deal with initializing self.grid_particle_count
-        if len(self._block_mapping.particle_types) == 0:
+        if len(_dset_mapping.particle_types) == 0:
             self.grid_particle_count[()] = 0
+
+        elif _concatenated_particles:
+            for g in self.grids:
+                idx = _p_mapping.idx_map[g.id]
+                assert len(idx) == 1  # sanity check!
+                slc = idx[0]
+                assert (
+                    (slc.start >= 0)
+                    and (slc.stop >= 0)
+                    and (slc.step is None or slc.step == 1)
+                )  # another sanity check!
+                self.grid_particle_count[g.id, 0] = slc.stop - slc.start
+
         else:
             # It's unfortunate that we need to go through and count up all of the
             # particles. To try to mitigate the cost, lets only do it on the root
@@ -124,11 +148,12 @@ class ChollaHierarchy(GridIndex):
             # -> the Enzo-E frontend appears to entirely skip initializing the
             #    self.grid_particle_count arrays (and I think it loads the data as it
             #    becomes needed)
+
             if self.comm.rank in (0, None):
                 for g in self.grids:
                     with _h5py.File(g.particle_filename, "r") as f:
                         n_particles = f.attrs["n_particles_local"][0]
-                        self.grid_particle_count[g.id, 0] = n_particles
+                    self.grid_particle_count[g.id, 0] = n_particles
             else:
                 pass
             self.grid_particle_count = self.comm.mpi_bcast(self.grid_particle_count)

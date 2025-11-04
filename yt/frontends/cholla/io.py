@@ -40,8 +40,7 @@ class ChollaIOHandler(BaseIOHandler):
         Iterator[tuple[tuple[ParticleType, str], np.ndarray]]
         | Iterator[tuple[ParticleType, tuple[np.ndarray, np.ndarray, np.ndarray]]]
     ):
-        # we use _CachedH5Openner because it's very plausible that we'll support
-        # reading from both distributed and concatenated datasets in the near future
+        mapper = self.ds.index._dataset_mapping.particle_mapping
         with _CachedH5Openner(mode="r") as h5_context_manager:
             for chunk in chunks:  # These should be organized by grid filename
                 for obj in chunk.objs:
@@ -60,16 +59,19 @@ class ChollaIOHandler(BaseIOHandler):
 
                     fh = h5_context_manager.open_fh(obj.particle_filename)
 
+                    assert len(self.ds.index._dataset_mapping.particle_types) <= 1
+
+                    # get the indices in a generic dataset that correspond to obj.id
+                    # (in the future, the indices probably need to be specific to both
+                    # the obj.id and the particle-type)
+                    idx = mapper.idx_map[obj.id]
+
                     for ptype, field_list in sorted(ptf.items()):
-                        if ptype != "io":  # sanity check
-                            raise AssertionError(
-                                'Currently, the Cholla frontend only supports the "io" '
-                                "particle-type, and this method was called to retrieve "
-                                f"data for the particle-types: {list(ptf)!r}"
-                            )
+                        # access HDF5 group containing the datasets of ptype properties
+                        grp = fh[mapper.h5_group.format(ptype=ptype)]
 
                         # retrieve the particle positions
-                        x, y, z = [fh[key][()] for key in ["pos_x", "pos_y", "pos_z"]]
+                        x, y, z = [grp[f"pos_{ax}"][idx].astype("=f8") for ax in "xyz"]
 
                         if selector is None:
                             # This only ever happens if the call is made from
@@ -80,14 +82,14 @@ class ChollaIOHandler(BaseIOHandler):
                         if mask is None:
                             continue
                         for field in field_list:
-                            data = np.asarray(fh[field][()], "=f8")
+                            data = np.asarray(grp[field][idx], "=f8")
                             yield (ptype, field), data[mask]
 
     def io_iter(self, chunks, fields):
         # this is loosely inspired by the implementation used for Enzo/Enzo-E
         # - those other implementations use the lower-level hdf5 interface. Unclear
         #   whether that affords any advantages...
-        mapper = self.ds.index._block_mapping
+        mapper = self.ds.index._dataset_mapping.field_mapping
         with _CachedH5Openner(mode="r") as h5_context_manager:
             for chunk in chunks:
                 for obj in chunk.objs:

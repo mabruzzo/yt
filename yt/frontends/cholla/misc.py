@@ -82,13 +82,9 @@ class ChollaDataFmt(enum.Enum):
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class _BlockDiskMapping:
-    """Contains info for mapping blockids to locations in hdf5 files
+    """Contains info for mapping blockids to locations in hdf5 files.
 
-    Notes
-    -----
-    At the time of writing, this is primarily meant to provide a mapping for
-    field data. In the future, we may initialize a separate instance to
-    provide a mapping for particle data
+    This is used for accessing field data or particle data.
     """
 
     # ``fname_template.format(blockid=...)`` produces the file containing blockid (this
@@ -99,20 +95,21 @@ class _BlockDiskMapping:
     # maps blockid to an index that select all associated data from a field-dataset
     idx_map: Mapping[int, tuple[int | slice, ...]]
 
-    # ``particle_fname_template`` is ``None`` or a string for which
-    # ``particle_fname_template.format(blockid=...)`` produces the file containing
-    # particles for the specified blockid
-    # -> at the time of writing, the particle data is never in the same file as hydro
-    #    data, but that could change in the future
-    particle_fname_template: str | None
+
+@dataclass(kw_only=True, slots=True, frozen=True)
+class _DatasetDiskMapping:
+    """Contains info for locating field-data and particle-data in hdf5 files"""
+
+    field_mapping: _BlockDiskMapping
+    particle_mapping: _BlockDiskMapping | None
     particle_types: tuple[ParticleType, ...]
 
 
-def _infer_particle_fname_template_and_types(
+def _infer_particle_mapping_and_types(
     block0_fluid_fname: str, fluid_data_fmt: ChollaDataFmt
-) -> tuple[str | None, tuple[ParticleType, ...]]:
+) -> tuple[_BlockDiskMapping | None, tuple[ParticleType, ...]]:
     """
-    Try to infer the fname template for loading particle data.
+    Try to infer the how particle data is organized on disk.
 
     Parameters
     ----------
@@ -124,7 +121,7 @@ def _infer_particle_fname_template_and_types(
 
     Returns
     -------
-    particle_fname_template: str or None
+    particle_mapping: _BlockDiskMapping or None
         This will be None if the template can't be inferred or there aren't
         any files at the expected locations.
     particle_types: tuple of strings
@@ -175,14 +172,38 @@ def _infer_particle_fname_template_and_types(
             f"doesn't contain any characters before the {expected_suffix!r} suffix"
         )
         return None, ()
-    template = f"{block0_fluid_fname[:-suf_len]}_particles.h5.{{blockid:d}}"
+    fname_template = f"{block0_fluid_fname[:-suf_len]}_particles.h5.{{blockid:d}}"
+    concat_fname = f"{block0_fluid_fname[:-suf_len]}_particles.h5"
 
-    if not os.path.isfile(template.format(blockid=0)):
+    if os.path.isfile(fname_template.format(blockid=0)):
+        ptypes = ("io",)
+        particle_mapping = _BlockDiskMapping(
+            fname_template=fname_template,
+            h5_group="./",
+            idx_map=defaultdict(lambda: (slice(None),)),
+        )
+    elif os.path.isfile(concat_fname):
+        with _h5py.File(concat_fname, "r") as f:
+            ptypes = tuple(f["particle"].keys())
+            assert len(ptypes) == 1  # temporary sanity check!
+            idx_map = {}
+            stop_block_idx_slc = f["particle"][ptypes[0]]["stop_block_idx_slc"][()]
+            for stored_idx, blockid in enumerate(f["domain/stored_blockid_list"][()]):
+                if stored_idx == 0:
+                    start = 0
+                else:
+                    start = stop_block_idx_slc[stored_idx - 1]
+                idx_map[blockid] = (slice(start, stop_block_idx_slc[stored_idx]),)
+        particle_mapping = _BlockDiskMapping(
+            fname_template=concat_fname, h5_group="particle/{ptype}", idx_map=idx_map
+        )
+
+    else:
         mylog.info("No particle data was found")
-        return None, ()
+        particle_mapping = None
+        ptypes = ()
 
-    # at the time of writing there is only a single particle type
-    return template, ("io",)
+    return particle_mapping, ptypes
 
 
 def _infer_blockid_location_arr(fname_template, global_dims, arr_shape):
@@ -204,7 +225,7 @@ def _infer_blockid_location_arr(fname_template, global_dims, arr_shape):
     return blockid_location_arr
 
 
-def _determine_data_layout(f: _h5py.File) -> tuple[np.ndarray, _BlockDiskMapping]:
+def _determine_data_layout(f: _h5py.File) -> tuple[np.ndarray, _DatasetDiskMapping]:
     """Determine the data layout of the snapshot
 
     The premise is that the basic different data formats shouldn't
@@ -286,21 +307,24 @@ def _determine_data_layout(f: _h5py.File) -> tuple[np.ndarray, _BlockDiskMapping
             fname_template = inferred_fname_template
         case _:
             raise RuntimeError("should be unreachable")
-
-    # STEP 5: Check if there is a particle dataset
-    # ============================================
-    particle_fname_template, particle_types = _infer_particle_fname_template_and_types(
-        block0_fluid_fname=filename, fluid_data_fmt=data_fmt
-    )
-
-    mapping = _BlockDiskMapping(
+    field_mapping = _BlockDiskMapping(
         fname_template=fname_template,
         h5_group="./" if flat_structure else "field",
         idx_map=field_idx_map,
-        particle_fname_template=particle_fname_template,
+    )
+
+    # STEP 5: Check if there is a particle dataset
+    # ============================================
+    particle_mapping, particle_types = _infer_particle_mapping_and_types(
+        block0_fluid_fname=filename, fluid_data_fmt=data_fmt
+    )
+
+    dset_mapping = _DatasetDiskMapping(
+        field_mapping=field_mapping,
+        particle_mapping=particle_mapping,
         particle_types=particle_types,
     )
-    return blockid_location_arr, mapping
+    return blockid_location_arr, dset_mapping
 
 
 def _infer_fname_template(filename: str) -> tuple[str, int | None]:
@@ -347,21 +371,26 @@ def _infer_fname_template(filename: str) -> tuple[str, int | None]:
 
 
 def _detect_particle_fields(
-    data_mapping: _BlockDiskMapping,
+    dset_mapping: _DatasetDiskMapping,
 ) -> list[tuple[ParticleType, str]]:
     # we insert a few assert statements to flag areas of code that need to be changed
     # if/when we add support for more particle-types
 
-    if len(data_mapping.particle_types) == 0:
+    if len(dset_mapping.particle_types) == 0:
         return []
-    assert data_mapping.particle_types == ("io",)
-    ptype = data_mapping.particle_types[0]
+    assert dset_mapping.particle_types == ("io",)
+    ptype = dset_mapping.particle_types[0]
 
-    path = data_mapping.particle_fname_template.format(blockid=0)
+    path = dset_mapping.particle_mapping.fname_template.format(blockid=0)
     with _h5py.File(path, mode="r") as h5f:
-        local_pfield_shape = (h5f.attrs["n_particles_local"][0],)
+        grp = h5f[dset_mapping.particle_mapping.h5_group.format(ptype=ptype)]
+        if "n_particles_local" in grp.attrs:
+            local_pfield_shape = (grp.attrs["n_particles_local"][0],)
+        else:
+            local_pfield_shape = (grp.attrs["total_ptype_count"][0],)
+
         out = []
-        for name, dataset in h5f.items():
+        for name, dataset in grp.items():
             assert isinstance(dataset, _h5py.Dataset)
             if dataset.shape != local_pfield_shape:
                 # ensures that we don't include "density," which is a 3D field
