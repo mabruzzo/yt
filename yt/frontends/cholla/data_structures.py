@@ -185,9 +185,15 @@ class ChollaDataset(Dataset):
         storage_filename=None,
         units_override=None,
         unit_system="cgs",
+        default_species_fields=None,
     ):
         self.fluid_types += ("cholla",)
-        super().__init__(filename, dataset_type, units_override=units_override)
+        super().__init__(
+            filename,
+            dataset_type,
+            units_override=units_override,
+            default_species_fields=default_species_fields,
+        )
         self.storage_filename = storage_filename
 
     def _set_code_unit_attributes(self):

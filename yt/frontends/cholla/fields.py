@@ -110,12 +110,25 @@ class ChollaFieldInfo(FieldInfoContainer):
                     / kboltz
                 )
 
-            self.add_field(
-                ("gas", "temperature"),
-                sampling_type="cell",
-                function=_temperature,
-                units=unit_system["temperature"],
-            )
+        else:
+            # this has a meaningful impact when
+            # self.ds.default_species_fields is not None
+
+            def _temperature(field, data):
+                return (
+                    data["gas", "mean_molecular_weight"]
+                    * data["gas", "pressure"]
+                    / data["gas", "density"]
+                    * mh
+                    / kboltz
+                )
+
+        self.add_field(
+            ("gas", "temperature"),
+            sampling_type="cell",
+            function=_temperature,
+            units=unit_system["temperature"],
+        )
 
         # Add color field if present (scalar0 / density)
         if ("cholla", "scalar0") in self.field_list:
